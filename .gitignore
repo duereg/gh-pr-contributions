@@ -1,0 +1,11 @@
+# History data (contains potentially sensitive usernames)
+data/history.json
+
+# Keep the data directory structure
+!data/.gitkeep
+
+# OS files
+.DS_Store
+
+# Reports
+reports/
