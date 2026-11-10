@@ -981,4 +981,6 @@ main() {
     echo "  Active Contributors: $contributors" >&2
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

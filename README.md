@@ -89,6 +89,14 @@ Each run produces (in the output directory):
 
 See `reports/*/report.md` for real examples of the generated output.
 
+## Tests
+
+Regression tests (no live GitHub) live under `tests/` and use a fake `gh` stub plus fixtures covering past bugs (pagination, parallel writes, silent fetch failures, rate-limit TSV leaks, merged-only metrics, history upsert).
+
+```bash
+./tests/run.sh
+```
+
 ## Notes
 
 - "Review time" is measured from when a PR was published (left draft, or created if never drafted) to when it was merged.

@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Fake `gh` for regression tests. Controlled via fixtures + env vars.
+set -euo pipefail
+
+FIXTURES="${GH_STUB_FIXTURES:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
+STATE_DIR="${GH_STUB_STATE_DIR:-/tmp/gh-stub-state}"
+mkdir -p "$STATE_DIR"
+
+json_escape() {
+    printf '%s' "$1" | jq -Rs .
+}
+
+# --- auth ---
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
+    exit 0
+fi
+
+# --- repo list ---
+if [[ "${1:-}" == "repo" && "${2:-}" == "list" ]]; then
+    # Support: gh repo list ORG --limit N --json name --jq '.[].name'
+    if [[ -f "$FIXTURES/repos.json" ]]; then
+        if [[ "$*" == *"--jq"* ]]; then
+            jq_expr=""
+            prev=""
+            for a in "$@"; do
+                if [[ "$prev" == "--jq" ]]; then
+                    jq_expr="$a"
+                fi
+                prev="$a"
+            done
+            jq -r "$jq_expr" "$FIXTURES/repos.json"
+        else
+            cat "$FIXTURES/repos.json"
+        fi
+    else
+        printf '%s\n' 'busy' 'quiet'
+    fi
+    exit 0
+fi
+
+# --- rate_limit ---
+if [[ "${1:-}" == "api" && "${2:-}" == "rate_limit" ]]; then
+    now=$(date +%s)
+    # Default: plenty remaining; reset already passed so retries sleep the minimum
+    reset=${GH_STUB_RATE_RESET:-$((now - 1))}
+    remaining=${GH_STUB_RATE_REMAINING:-5000}
+    payload=$(jq -n --argjson reset "$reset" --argjson remaining "$remaining" '{
+        resources: {
+            graphql: { remaining: $remaining, limit: 5000, reset: $reset },
+            core: { remaining: $remaining, limit: 5000, reset: $reset }
+        }
+    }')
+    if [[ "$*" == *"--jq"* ]]; then
+        jq_expr=""
+        prev=""
+        for a in "$@"; do
+            if [[ "$prev" == "--jq" ]]; then
+                jq_expr="$a"
+            fi
+            prev="$a"
+        done
+        echo "$payload" | jq -r "$jq_expr"
+    else
+        echo "$payload"
+    fi
+    exit 0
+fi
+
+# --- graphql ---
+if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
+    owner=""
+    repo=""
+    number=""
+    jq_filter=""
+    prev=""
+    for a in "$@"; do
+        case "$prev" in
+            -f)
+                if [[ "$a" == owner=* ]]; then owner="${a#owner=}"
+                elif [[ "$a" == repo=* ]]; then repo="${a#repo=}"
+                fi
+                ;;
+            -F)
+                if [[ "$a" == number=* ]]; then number="${a#number=}"
+                fi
+                ;;
+            --jq)
+                jq_filter="$a"
+                ;;
+        esac
+        prev="$a"
+    done
+
+    # Also parse -f owner= / -F number= forms that gh uses with separate args
+    # Our worker uses: -f owner="$org" -f repo="$repo" -F number="$pr_num"
+    # which becomes: -f owner=ORG as a single argv from gh's perspective when using -f owner=val
+    # Actually bash passes: -f owner="$org" as two args: -f and owner=value? 
+    # Looking at worker: -f owner="$org" is ONE argument to gh if written that way...
+    # In the worker: `-f owner="$org"` is a single shell word: owner=workwhile style
+    # Wait: `-f owner="$org"` → argv: `-f`, `owner=workwhile` when it's `-f owner="$org"` 
+    # In bash, `-f owner="$org"` is TWO arguments: `-f` and `owner=value`.
+    
+    key="${repo}_${number}"
+    count_file="$STATE_DIR/graphql_${key}.count"
+    count=0
+    if [[ -f "$count_file" ]]; then
+        count=$(cat "$count_file")
+    fi
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+
+    rate_times="${GH_STUB_RATE_LIMIT_TIMES:-0}"
+    # Per-PR override: GH_STUB_RATE_LIMIT_PR=repo:num:times
+    if [[ -n "${GH_STUB_RATE_LIMIT_PR:-}" ]]; then
+        IFS=':' read -r rl_repo rl_num rl_times <<< "$GH_STUB_RATE_LIMIT_PR"
+        if [[ "$repo" == "$rl_repo" && "$number" == "$rl_num" ]]; then
+            rate_times="$rl_times"
+        fi
+    fi
+
+    if [[ "$rate_times" -gt 0 && "$count" -le "$rate_times" ]]; then
+        # Mimic failed gh: JSON error on stdout + message on stderr, non-zero exit.
+        # Worker must NOT concatenate this stdout into the TSV.
+        echo '{"errors":[{"type":"RATE_LIMIT","code":"graphql_rate_limit","message":"API rate limit already exceeded"}]}'
+        echo "API rate limit already exceeded for user ID 1" >&2
+        exit 1
+    fi
+
+    # Hard failure mode (non-rate-limit) for leak tests
+    if [[ "${GH_STUB_GRAPHQL_FAIL:-}" == "1" ]]; then
+        echo '{"errors":[{"message":"boom"}]}'
+        echo "graphql failed" >&2
+        exit 1
+    fi
+
+    fixture="$FIXTURES/graphql/${repo}/${number}.json"
+    if [[ -f "$fixture" ]]; then
+        payload=$(cat "$fixture")
+    else
+        # Sensible defaults for generated/busy PRs
+        payload=$(jq -n --argjson num "${number:-0}" '{
+            data: {
+                repository: {
+                    pullRequest: {
+                        commits: { totalCount: 2 },
+                        publishedAt: "2026-10-20T12:00:00Z",
+                        additions: 10,
+                        deletions: 1,
+                        changedFiles: 2
+                    }
+                }
+            }
+        }')
+    fi
+
+    if [[ -n "$jq_filter" ]]; then
+        echo "$payload" | jq -r "$jq_filter"
+    else
+        echo "$payload"
+    fi
+    exit 0
+fi
+
+# --- pulls list: api repos/ORG/REPO/pulls?... ---
+if [[ "${1:-}" == "api" && "${2:-}" == repos/* ]]; then
+    path="${2%%\?*}"
+    if [[ "$2" == *"?"* ]]; then
+        query="${2#*\?}"
+    else
+        query=""
+    fi
+    # path like repos/org/busy/pulls
+    repo=$(echo "$path" | awk -F/ '{print $3}')
+
+    if [[ "${GH_STUB_FAIL_REPOS:-}" == *"$repo"* ]]; then
+        echo "HTTP 502: upstream error for $repo" >&2
+        exit 1
+    fi
+
+    page=1
+    if [[ "$query" == *"page="* ]]; then
+        page=$(echo "$query" | sed -n 's/.*page=\([0-9]*\).*/\1/p')
+    fi
+    per_page=100
+    if [[ "$query" == *"per_page="* ]]; then
+        per_page=$(echo "$query" | sed -n 's/.*per_page=\([0-9]*\).*/\1/p')
+    fi
+
+    # Static fixture pages take precedence
+    page_file="$FIXTURES/repos/${repo}/page-${page}.json"
+    if [[ -f "$page_file" ]]; then
+        cat "$page_file"
+        exit 0
+    fi
+
+    # Dynamic busy-backend: pages 1-5 filled with out-of-window PRs that are
+    # still "recently updated" so pagination continues; page 6 has in-window merges.
+    if [[ "$repo" == "busy" ]]; then
+        # Window assumed by fixtures: since 2026-10-15, until 2026-11-09
+        if [[ "$page" -le 5 ]]; then
+            jq -n --argjson page "$page" --argjson per "$per_page" '
+                [range(0; $per) | . as $i | {
+                    number: (($page - 1) * $per + $i + 1),
+                    title: "noise page \($page) #\($i)",
+                    user: { login: "noise-user" },
+                    created_at: "2026-01-01T00:00:00Z",
+                    merged_at: "2026-01-02T00:00:00Z",
+                    updated_at: "2026-10-20T00:00:00Z"
+                }]
+            '
+            exit 0
+        elif [[ "$page" -eq 6 ]]; then
+            # In-window merges + one open PR created in window (large additions via graphql)
+            cat <<'EOF'
+[
+  {
+    "number": 9001,
+    "title": "busy in-window merge A",
+    "user": { "login": "alice" },
+    "created_at": "2026-09-01T00:00:00Z",
+    "merged_at": "2026-10-20T15:00:00Z",
+    "updated_at": "2026-10-20T15:00:00Z"
+  },
+  {
+    "number": 9002,
+    "title": "busy in-window merge B",
+    "user": { "login": "bob" },
+    "created_at": "2026-10-16T00:00:00Z",
+    "merged_at": "2026-10-18T12:00:00Z",
+    "updated_at": "2026-10-18T12:00:00Z"
+  },
+  {
+    "number": 9003,
+    "title": "busy open draft",
+    "user": { "login": "carol" },
+    "created_at": "2026-10-25T00:00:00Z",
+    "merged_at": null,
+    "updated_at": "2026-10-26T00:00:00Z"
+  }
+]
+EOF
+            exit 0
+        else
+            # Page older than since — stop condition
+            jq -n '[
+              {
+                number: 1,
+                title: "ancient",
+                user: { login: "old" },
+                created_at: "2025-01-01T00:00:00Z",
+                merged_at: "2025-01-02T00:00:00Z",
+                updated_at: "2025-01-02T00:00:00Z"
+              }
+            ]'
+            exit 0
+        fi
+    fi
+
+    # Default empty page
+    echo '[]'
+    exit 0
+fi
+
+echo "gh-stub: unhandled argv: $*" >&2
+exit 1

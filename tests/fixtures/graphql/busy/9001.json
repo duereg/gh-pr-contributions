@@ -1,0 +1,13 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "commits": { "totalCount": 3 },
+        "publishedAt": "2026-10-19T12:00:00Z",
+        "additions": 50,
+        "deletions": 5,
+        "changedFiles": 4
+      }
+    }
+  }
+}
