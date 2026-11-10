@@ -282,45 +282,8 @@ fetch_repos() {
     fi
 }
 
-# Create helper script for fetching PR details
-create_pr_detail_worker() {
-    local script_path="$1"
-    cat > "$script_path" << 'WORKER_SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-org="$1"
-repo="$2"
-pr_num="$3"
-debug="$4"
-
-[[ "$debug" == "true" ]] && echo "[DEBUG] Fetching details for $org/$repo#$pr_num" >&2
-
-# Fetch detailed PR info including commits count
-pr_data=$(gh api "repos/${org}/${repo}/pulls/${pr_num}" 2>/dev/null || echo "{}")
-
-if [[ -z "$pr_data" || "$pr_data" == "{}" ]]; then
-    exit 0
-fi
-
-echo "$pr_data" | jq -c --arg repo "$repo" '{
-    repo: $repo,
-    number: .number,
-    author: .user.login,
-    state: .state,
-    merged: .merged,
-    merged_at: .merged_at,
-    created_at: .created_at,
-    additions: .additions,
-    deletions: .deletions,
-    changed_files: .changed_files,
-    commits: .commits
-}' 2>/dev/null || true
-WORKER_SCRIPT
-    chmod +x "$script_path"
-}
-
-# Create helper script for fetching PRs from a repo
+# Create helper script for fetching PRs from a repo.
+# Pages 100 at a time by updated_at desc until every PR on a page is older than --since.
 create_repo_worker() {
     local script_path="$1"
     cat > "$script_path" << 'WORKER_SCRIPT'
@@ -330,56 +293,138 @@ set -euo pipefail
 org="$1"
 repo="$2"
 since="$3"
-until="$4"
-state="$5"
+until_date="$4"
+out_file="$5"
+errors_file="$6"
 
-# Fetch PRs for this repo (without commits to avoid GraphQL limits)
-gh pr list --repo "${org}/${repo}" \
-    --state "$state" \
-    --limit 500 \
-    --json number,title,author,createdAt,mergedAt,additions,deletions,changedFiles 2>/dev/null | \
-    jq -c --arg since "${since}T00:00:00Z" --arg until "${until}T23:59:59Z" --arg repo "$repo" '
-        .[] | 
+since_ts="${since}T00:00:00Z"
+until_ts="${until_date}T23:59:59Z"
+page=1
+per_page=100
+
+: > "$out_file"
+
+while true; do
+    err_file=$(mktemp)
+    if ! page_json=$(gh api \
+        "repos/${org}/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=${per_page}&page=${page}" \
+        2>"$err_file"); then
+        err_msg=$(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]]*$//')
+        rm -f "$err_file"
+        echo -e "FAIL\t${repo}\tpage ${page}: ${err_msg}" >> "$errors_file"
+        exit 1
+    fi
+    rm -f "$err_file"
+
+    page_len=$(echo "$page_json" | jq 'length')
+    if [[ "$page_len" -eq 0 ]]; then
+        break
+    fi
+
+    echo "$page_json" | jq -c --arg since "$since_ts" --arg until "$until_ts" --arg repo "$repo" '
+        .[] |
         select(
-            (.mergedAt != null and .mergedAt >= $since and .mergedAt <= $until) or
-            (.mergedAt == null and .createdAt >= $since and .createdAt <= $until)
+            (.merged_at != null and .merged_at >= $since and .merged_at <= $until) or
+            (.merged_at == null and .created_at >= $since and .created_at <= $until)
         ) |
         {
             repo: $repo,
             number: .number,
             title: .title,
-            author: .author.login,
-            merged: (.mergedAt != null),
-            merged_at: .mergedAt,
-            created_at: .createdAt,
-            additions: .additions,
-            deletions: .deletions,
-            changed_files: .changedFiles
+            author: (.user.login // "unknown"),
+            merged: (.merged_at != null),
+            merged_at: .merged_at,
+            created_at: .created_at
         }
-    ' 2>/dev/null || true
+    ' >> "$out_file"
+
+    # Stop once the entire page is older than the window (updated_at tracks merges).
+    all_before_since=$(echo "$page_json" | jq --arg since "$since_ts" '
+        all(.[]; .updated_at < $since)
+    ')
+    if [[ "$all_before_since" == "true" ]]; then
+        break
+    fi
+
+    if [[ "$page_len" -lt "$per_page" ]]; then
+        break
+    fi
+
+    page=$((page + 1))
+done
 WORKER_SCRIPT
     chmod +x "$script_path"
 }
 
-# Create helper script for fetching commit count and publishedAt for a PR
+# Fetch commit count, publishedAt, and diff stats for a PR into a dedicated out file
 create_commit_worker() {
     local script_path="$1"
     cat > "$script_path" << 'WORKER_SCRIPT'
 #!/usr/bin/env bash
+set -euo pipefail
 org="$1"
 repo="$2"
 pr_num="$3"
-result=$(gh api graphql -f query='
+out_file="$4"
+
+query='
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
       commits { totalCount }
       publishedAt
+      additions
+      deletions
+      changedFiles
     }
   }
-}' -f owner="$org" -f repo="$repo" -F number="$pr_num" \
-  --jq '.data.repository.pullRequest | "\(.commits.totalCount)\t\(.publishedAt // "")"' 2>/dev/null || echo "0	")
-echo "${repo}	${pr_num}	${result}"
+}'
+jq_filter='
+  .data.repository.pullRequest as $pr
+  | if $pr == null then "0\t\t0\t0\t0"
+    else "\($pr.commits.totalCount // 0)\t\($pr.publishedAt // "")\t\($pr.additions // 0)\t\($pr.deletions // 0)\t\($pr.changedFiles // 0)"
+    end
+'
+
+result=""
+attempt=1
+max_attempts=8
+while [[ $attempt -le $max_attempts ]]; do
+    err_file=$(mktemp)
+    set +e
+    # Capture stdout alone; never concatenate failed-gh stdout with the fallback.
+    out=$(gh api graphql -f query="$query" -f owner="$org" -f repo="$repo" -F number="$pr_num" \
+        --jq "$jq_filter" 2>"$err_file")
+    status=$?
+    set -e
+
+    if [[ $status -eq 0 && -n "$out" && "$out" != *'{'* ]]; then
+        result="${out%$'\n'}"
+        rm -f "$err_file"
+        break
+    fi
+
+    err_msg=$(tr '\n' ' ' < "$err_file")
+    rm -f "$err_file"
+
+    if [[ "$err_msg" == *[Rr]ate*[Ll]imit* || "$out" == *[Rr]ate*[Ll]imit* || "$out" == *graphql_rate_limit* ]]; then
+        reset=$(gh api rate_limit --jq '.resources.graphql.reset // .resources.core.reset // 0' 2>/dev/null || echo 0)
+        now=$(date +%s)
+        wait=$((reset - now + 5))
+        if [[ $wait -lt 15 ]]; then wait=45; fi
+        if [[ $wait -gt 900 ]]; then wait=120; fi
+        echo "Rate limited on ${repo}#${pr_num}; sleeping ${wait}s (attempt ${attempt}/${max_attempts})" >&2
+        sleep "$wait"
+    else
+        break
+    fi
+    attempt=$((attempt + 1))
+done
+
+if [[ -z "$result" ]]; then
+    result=$'0\t\t0\t0\t0'
+fi
+printf '%s\t%s\t%s\n' "$repo" "$pr_num" "$result" > "$out_file"
 WORKER_SCRIPT
     chmod +x "$script_path"
 }
@@ -392,7 +437,9 @@ collect_contribution_data() {
     local repo_worker="$TEMP_DIR/repo_worker.sh"
     local commit_worker="$TEMP_DIR/commit_worker.sh"
     local errors_file="$TEMP_DIR/errors.log"
+    local repos_dir="$TEMP_DIR/repos"
     
+    mkdir -p "$repos_dir"
     : > "$pr_data_file"
     : > "$commit_counts_file"
     : > "$errors_file"
@@ -415,10 +462,55 @@ collect_contribution_data() {
     repo_count=$(echo "$repos" | grep -c . || echo "0")
     log_info "Found $repo_count repositories to scan"
     
-    # Phase 1: Fetch all PRs from all repos in parallel (without commits to avoid GraphQL limits)
+    # Phase 1: Fetch PRs from all repos in parallel (one output file per repo)
     log_info "Phase 1: Fetching PRs from all repos (parallel with $PARALLEL_JOBS jobs)..."
     
-    echo "$repos" | xargs -P "$PARALLEL_JOBS" -I {} "$repo_worker" "$ORG" "{}" "$SINCE" "$UNTIL" "all" >> "$pr_data_file" 2>>"$errors_file"
+    local repo_dispatch="$TEMP_DIR/repo_dispatch.sh"
+    cat > "$repo_dispatch" << 'DISPATCH'
+#!/usr/bin/env bash
+set -euo pipefail
+worker="$1"
+org="$2"
+repo="$3"
+since="$4"
+until_date="$5"
+repos_dir="$6"
+errors_file="$7"
+"$worker" "$org" "$repo" "$since" "$until_date" "${repos_dir}/${repo}.jsonl" "$errors_file"
+DISPATCH
+    chmod +x "$repo_dispatch"
+    
+    # xargs does not always fail the parent on worker failure; check status + errors_file.
+    set +e
+    echo "$repos" | xargs -P "$PARALLEL_JOBS" -I {} \
+        "$repo_dispatch" "$repo_worker" "$ORG" "{}" "$SINCE" "$UNTIL" "$repos_dir" "$errors_file"
+    local xargs_status=$?
+    set -e
+    
+    if [[ "$xargs_status" -ne 0 ]]; then
+        log_error "Repo fetch failed (xargs exit ${xargs_status}). Often a sandbox/environment limit — re-run outside the sandbox."
+        if [[ -s "$errors_file" ]]; then
+            while IFS=$'\t' read -r _status failed_repo detail; do
+                log_error "  ${failed_repo}: ${detail}"
+            done < "$errors_file"
+        fi
+        exit 1
+    fi
+    
+    if [[ -s "$errors_file" ]]; then
+        log_error "Failed to fetch PRs from one or more repositories:"
+        while IFS=$'\t' read -r _status failed_repo detail; do
+            log_error "  ${failed_repo}: ${detail}"
+        done < "$errors_file"
+        exit 1
+    fi
+    
+    local repo_file
+    for repo_file in "$repos_dir"/*.jsonl; do
+        [[ -e "$repo_file" ]] || continue
+        [[ -s "$repo_file" ]] || continue
+        cat "$repo_file" >> "$pr_data_file"
+    done
     
     local total_prs
     total_prs=$(wc -l < "$pr_data_file" | tr -d ' ')
@@ -430,45 +522,68 @@ collect_contribution_data() {
         return
     fi
     
-    # Phase 2: Fetch commit counts and review timing for each PR in parallel
-    log_info "Phase 2: Fetching commit counts and review timing for $total_prs PRs..."
+    # Phase 2: Fetch commit counts, review timing, and diff stats for each PR
+    log_info "Phase 2: Fetching commit counts, review timing, and diff stats for $total_prs PRs..."
     
-    # Extract repo and PR number, then fetch commits
+    local stats_dir="$TEMP_DIR/stats"
+    mkdir -p "$stats_dir"
+    
     while IFS= read -r line; do
         repo=$(echo "$line" | jq -r '.repo')
         pr_num=$(echo "$line" | jq -r '.number')
-        echo "$ORG $repo $pr_num"
-    done < "$pr_data_file" | xargs -P "$PARALLEL_JOBS" -L 1 "$commit_worker" >> "$commit_counts_file" 2>>"$errors_file"
+        echo "$ORG $repo $pr_num ${stats_dir}/${repo}_${pr_num}.tsv"
+    done < "$pr_data_file" | xargs -P "$PARALLEL_JOBS" -L 1 "$commit_worker"
     
-    # Merge commit counts back into PR data
+    local stats_file
+    for stats_file in "$stats_dir"/*.tsv; do
+        [[ -e "$stats_file" ]] || continue
+        cat "$stats_file" >> "$commit_counts_file"
+    done
+    
+    # Merge stats back into PR data
     log_info "Phase 3: Aggregating results..."
     
     local result
+    local stats_json_file="$TEMP_DIR/stats.json"
     if [[ -s "$pr_data_file" ]]; then
-        # Build commit and publishedAt lookups from TSV file
-        declare -A commit_lookup
-        declare -A published_lookup
-        while IFS=$'\t' read -r repo pr_num commits published_at; do
-            commit_lookup["${repo}_${pr_num}"]="${commits:-0}"
-            published_lookup["${repo}_${pr_num}"]="${published_at:-}"
-        done < "$commit_counts_file"
+        if [[ -s "$commit_counts_file" ]]; then
+            jq -R -c '
+                split("\t")
+                | select(length >= 3)
+                | {
+                    key: "\(.[0])_\(.[1])",
+                    commits: ((.[2] // "0") | if . == "" then 0 else tonumber end),
+                    published_at: (.[3] // "" | if . == "" then null else . end),
+                    additions: ((.[4] // "0") | if . == "" then 0 else tonumber end),
+                    deletions: ((.[5] // "0") | if . == "" then 0 else tonumber end),
+                    changed_files: ((.[6] // "0") | if . == "" then 0 else tonumber end)
+                  }
+            ' "$commit_counts_file" \
+              | jq -s 'map({(.key): del(.key)}) | add // {}' > "$stats_json_file"
+        else
+            echo '{}' > "$stats_json_file"
+        fi
         
-        # Add commits and published_at to PR data and aggregate
-        result=$(cat "$pr_data_file" | while IFS= read -r line; do
-            repo=$(echo "$line" | jq -r '.repo')
-            pr_num=$(echo "$line" | jq -r '.number')
-            commits="${commit_lookup["${repo}_${pr_num}"]:-0}"
-            published_at="${published_lookup["${repo}_${pr_num}"]:-}"
-            echo "$line" | jq -c --argjson commits "$commits" --arg pub "$published_at" '. + {commits: $commits, published_at: (if $pub == "" then null else $pub end)}'
-        done | jq -s --arg since "$SINCE" --arg until "$UNTIL" --argjson repos_scanned "$repo_count" '
+        result=$(jq -s --slurpfile stats "$stats_json_file" \
+            --arg since "$SINCE" --arg until "$UNTIL" --argjson repos_scanned "$repo_count" '
             def parse_iso: sub("\\.[0-9]+"; "") | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
-            # Group by author
+            ($stats[0] // {}) as $s |
+            map(
+                . as $pr
+                | ($s[$pr.repo + "_" + ($pr.number | tostring)] // {}) as $st
+                | $pr + {
+                    commits: ($st.commits // 0),
+                    published_at: ($st.published_at // null),
+                    additions: ($st.additions // 0),
+                    deletions: ($st.deletions // 0),
+                    changed_files: ($st.changed_files // 0)
+                }
+            ) |
             group_by(.author) |
             map({
                 user: .[0].author,
                 prs_merged: [.[] | select(.merged == true)] | length,
                 prs_opened: length,
-                # Only count lines/files/commits from MERGED PRs
                 additions: ([.[] | select(.merged == true) | .additions] | add // 0),
                 deletions: ([.[] | select(.merged == true) | .deletions] | add // 0),
                 files_changed: ([.[] | select(.merged == true) | .changed_files] | add // 0),
@@ -480,16 +595,13 @@ collect_contribution_data() {
                     if . < 0 then 0 else . end
                 ]
             }) |
-            # Calculate averages
             map(. + {
                 avg_pr_size: (if .prs_merged > 0 then ((.additions + .deletions) / .prs_merged | floor) else 0 end),
                 avg_review_hours: (if (.review_hours_list | length) > 0 then (.review_hours_list | add / length * 10 | floor) / 10 else null end),
                 total_review_hours: (.review_hours_list | add // 0),
                 review_pr_count: (.review_hours_list | length)
             } | del(.review_hours_list)) |
-            # Convert to object keyed by user
             reduce .[] as $item ({}; .[$item.user] = ($item | del(.user))) |
-            # Build final structure
             {
                 users: .,
                 summary: {
@@ -513,7 +625,7 @@ collect_contribution_data() {
                     until: $until
                 }
             }
-        ')
+        ' "$pr_data_file")
     else
         result=$(jq -n --arg since "$SINCE" --arg until "$UNTIL" --argjson repos_scanned "$repo_count" '{
             users: {},
@@ -534,12 +646,6 @@ collect_contribution_data() {
                 until: $until
             }
         }')
-    fi
-    
-    # Check for errors
-    if [[ -s "$errors_file" ]] && [[ "$DEBUG" == "true" ]]; then
-        log_debug "Errors during processing:"
-        head -20 "$errors_file" >&2
     fi
     
     echo "$result"

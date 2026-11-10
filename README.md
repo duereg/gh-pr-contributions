@@ -65,8 +65,8 @@ Data collection is parallelized (repo fetch and per-PR commit/review lookups bot
 
 The script has three phases per run (see `collect_contribution_data`):
 
-1. **Fetch PRs** — `gh repo list` gets all repo names, then a worker script (`gh pr list ... --json ...`) runs per repo in parallel, filtering PRs whose `mergedAt` (or `createdAt`, if unmerged) falls in `[since, until]`.
-2. **Fetch commit counts & review timing** — for every PR found, a second worker script runs a GraphQL query (`gh api graphql`) in parallel to get the commit count and `publishedAt` (when the PR left draft state — used as the start of the "review clock" instead of `createdAt`).
+1. **Fetch PRs** — `gh repo list` gets all repo names, then a worker per repo pages the pulls API (100 at a time, `sort=updated&direction=desc`) until a full page is older than `--since`. Matching PRs (`merged_at` in window, or unmerged with `created_at` in window) are written to a **per-repo** temp file. Lightweight fields only — no diff stats in this phase. If any repo fetch fails, the run aborts.
+2. **Fetch commit counts, review timing & diff stats** — for every PR found, a second worker runs a GraphQL query in parallel for commit count, `publishedAt` (when the PR left draft — start of the review clock), plus `additions` / `deletions` / `changedFiles`.
 3. **Aggregate** — results are merged and grouped by author with `jq`, computing per-user and org-wide totals/averages. Only **merged** PRs count toward lines/files/commits/review-time metrics; both merged and unmerged PRs count toward "PRs opened."
 
 After aggregation:
